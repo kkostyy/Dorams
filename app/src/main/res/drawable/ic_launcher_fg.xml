@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Кадр-плёнка с кнопкой play, в стиле иконки LOGOPED -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M37,36H71A6,6 0 0 1 77,42V66A6,6 0 0 1 71,72H37A6,6 0 0 1 31,66V42A6,6 0 0 1 37,36Z" />
+    <path android:fillColor="#DFE5FF"
+        android:pathData="M37,36H71A6,6 0 0 1 77,42V46H31V42A6,6 0 0 1 37,36Z" />
+    <path android:fillColor="#4F6BED"
+        android:pathData="M36,39.5h4v3h-4z M44,39.5h4v3h-4z M52,39.5h4v3h-4z M60,39.5h4v3h-4z M68,39.5h4v3h-4z" />
+    <path android:fillColor="#FF8A65"
+        android:pathData="M49,52.5L61,59L49,65.5Z" />
+</vector>

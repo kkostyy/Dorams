@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Палитра из LOGOPED (светлая тема) -->
+<resources>
+    <color name="bg">#F4F5FA</color>
+    <color name="card">#FFFFFF</color>
+    <color name="card_border">#0F141932</color>
+    <color name="text">#1D2130</color>
+    <color name="muted">#6B7185</color>
+    <color name="line">#E3E5EE</color>
+    <color name="accent">#4F6BED</color>
+    <color name="accent_soft">#E8ECFD</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="ok">#1F9D55</color>
+    <color name="ok_soft">#E3F5EA</color>
+    <color name="bad">#D64545</color>
+    <color name="bad_soft">#FBE7E7</color>
+    <color name="warn">#B7791F</color>
+    <color name="warn_soft">#FBF0DC</color>
+    <color name="ic_bg">#4F6BED</color>
+</resources>

@@ -1,181 +1,378 @@
 package com.dorama.cutter
 
+import android.Manifest
 import android.app.Activity
+import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Canvas
+import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Typeface
-import android.media.MediaExtractor
-import android.media.MediaFormat
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
+import android.os.StatFs
 import android.provider.OpenableColumns
 import android.text.InputType
+import android.text.TextUtils
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.Window
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
-import androidx.media3.common.Effect
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.effect.BitmapOverlay
-import androidx.media3.effect.OverlayEffect
-import androidx.media3.effect.Presentation
-import androidx.media3.effect.ScaleAndRotateTransformation
-import androidx.media3.effect.TextureOverlay
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.Effects
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
-import com.google.common.collect.ImmutableList
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.nio.ByteBuffer
 import java.util.Locale
 
-private const val INTRO_S = 4L   // сколько секунд показывать «Поверните экран»
-private const val END_S = 10L    // сколько секунд показывать финальный экран
-private const val WINDOW_MS = 10 * 60_000L  // ИИ ищет клиффхэнгер за 10 минут до лимита части
-private const val DEFAULT_TAGS =
-    "#дорама #китайскаядорама #дорамы #сериал #русскаяозвучка #рекомендации #fyp"
-private const val GEMINI = "https://generativelanguage.googleapis.com"
-
-/** Клиффхэнгер, найденный ИИ. */
-data class Hook(val tMs: Long, val score: Int, val teaser: String, val nextHook: String)
-
-/** Одна часть: границы, заголовок начала и текст финального экрана. */
-data class Part(val a: Long, val b: Long, val hook: String?, val teaser: String?)
-
-/** Накладка на весь кадр 1080x1920: интро / плашка части / финальный экран. */
-class PartOverlay(
-    private val intro: Bitmap,
-    private val main: Bitmap,
-    private val end: Bitmap,
-    private val introEndUs: Long,
-    private val endStartUs: Long
-) : BitmapOverlay() {
-    override fun getBitmap(presentationTimeUs: Long): Bitmap = when {
-        presentationTimeUs < introEndUs -> intro
-        presentationTimeUs >= endStartUs -> end
-        else -> main
-    }
-}
-
 class MainActivity : Activity() {
+    private lateinit var ui: Ui
     private val handler = Handler(Looper.getMainLooper())
-    private var srcUri: Uri? = null
-    private var baseName = "video"
-    private var durMs = 0L
-    private var parts: List<Part> = emptyList()
-    private var hooks: List<Hook> = emptyList()
-    private var firstHook: String? = null
-    private var aiSummary = ""
-    private var curIdx = 0
-    private var running = false
-    private var aiMode = false
-    private var cancelled = false
-    private var transformer: Transformer? = null
+    private val prefs by lazy { getSharedPreferences("s", MODE_PRIVATE) }
 
-    private lateinit var pickBtn: Button
-    private lateinit var aiBtn: Button
-    private lateinit var startBtn: Button
-    private lateinit var stopBtn: Button
-    private lateinit var infoTv: TextView
+    private lateinit var col: LinearLayout
+    private lateinit var videoName: TextView
+    private lateinit var videoMeta: TextView
+    private lateinit var pickBtn: TextView
     private lateinit var titleEt: EditText
     private lateinit var tgEt: EditText
     private lateinit var tagsEt: EditText
     private lateinit var maxEt: EditText
+    private lateinit var rateEt: EditText
     private lateinit var keyEt: EditText
     private lateinit var modelEt: EditText
-    private lateinit var bar: ProgressBar
-    private lateinit var statusTv: TextView
+    private lateinit var aiBtn: TextView
+    private lateinit var aiSummary: TextView
+    private lateinit var planReset: TextView
+    private lateinit var planInfo: TextView
+    private lateinit var planBox: LinearLayout
+    private lateinit var spaceTv: TextView
+    private lateinit var resultHead: View
+    private lateinit var resultCard: LinearLayout
     private lateinit var resultTv: TextView
+    private lateinit var statusTv: TextView
+    private lateinit var pctTv: TextView
+    private lateinit var meter: Meter
+    private lateinit var startBtn: TextView
+    private lateinit var stopBtn: TextView
+    private lateinit var resumeBtn: TextView
+    private lateinit var toastTv: TextView
+
+    private val onEngine: () -> Unit = { renderEngine() }
+    private val hideToast = Runnable {
+        toastTv.animate().alpha(0f).translationY(ui.dpf(10)).setDuration(220)
+            .withEndAction { toastTv.visibility = View.GONE }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad * 2, pad, pad)
+        ui = Ui(this)
+        col = ui.column().apply { setPadding(ui.dp(16), ui.dp(18), ui.dp(16), ui.dp(220)) }
+        val scroll = ScrollView(this).apply {
+            addView(col)
+            isVerticalScrollBarEnabled = false
         }
-        setContentView(ScrollView(this).apply { addView(root) })
-        val sp = getSharedPreferences("s", MODE_PRIVATE)
+        val root = FrameLayout(this).apply { setBackgroundColor(ui.bg) }
+        root.addView(scroll, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        buildHeader()
+        buildVideo()
+        buildDesign()
+        buildCut()
+        buildAi()
+        buildPlan()
+        buildResult()
+        val bar = buildBar()
+        root.addView(bar, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
+        setContentView(root)
+        // пока открыта клавиатура, нижняя панель не закрывает поля ввода
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            val r = Rect()
+            root.getWindowVisibleDisplayFrame(r)
+            val h = root.rootView.height
+            val v = if (h - r.bottom > h / 4) View.GONE else View.VISIBLE
+            if (bar.visibility != v) bar.visibility = v
+        }
 
-        fun field(h: String, v: String = "") = EditText(this).apply {
-            hint = h
-            setText(v)
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-
-        pickBtn = Button(this).apply { text = "1. Выбрать видео"; setOnClickListener { onPickClick() } }
-        infoTv = TextView(this).apply { text = "Видео не выбрано" }
-        titleEt = field("Название дорамы")
-        tgEt = field("Telegram, например @my_channel")
-        tagsEt = field("Хештеги", DEFAULT_TAGS)
-        maxEt = field("Макс. минут в части", "60").apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            addTextChangedListener(object : android.text.TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun afterTextChanged(s: android.text.Editable?) { showPlan() }
-            })
-        }
-        keyEt = field("API-ключ Gemini (aistudio.google.com/apikey)", sp.getString("key", "") ?: "").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        modelEt = field("Модель Gemini", sp.getString("model", "gemini-3.5-flash") ?: "gemini-3.5-flash")
-        aiBtn = Button(this).apply {
-            text = "ИИ: найти места для разреза (необязательно)"
-            setOnClickListener { onAiClick() }
-        }
-        val copyBtn = Button(this).apply {
-            text = "Скопировать хештеги"
-            setOnClickListener {
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("tags", tagsEt.text.toString()))
-                statusTv.text = "Хештеги скопированы"
-            }
-        }
-        startBtn = Button(this).apply { text = "2. Начать нарезку"; setOnClickListener { onStartClick() } }
-        stopBtn = Button(this).apply {
-            text = "Остановить"
-            isEnabled = false
-            setOnClickListener { onStopClick() }
-        }
-        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
-        statusTv = TextView(this).apply {
-            text = "Не закрывай приложение и держи телефон на зарядке."
-        }
-        resultTv = TextView(this).apply { setTextIsSelectable(true) }
-
-        listOf<android.view.View>(
-            pickBtn, infoTv, titleEt, tgEt, tagsEt, copyBtn, maxEt,
-            keyEt, modelEt, aiBtn,
-            startBtn, stopBtn, bar, statusTv, resultTv
-        ).forEach { root.addView(it) }
+        maxEt.onChange { renderPlan() }
+        rateEt.onChange { renderSpace() }
+        Engine.listen(onEngine)
+        renderVideo()
+        renderPlan()
     }
 
-    // ---------- выбор файла ----------
+    override fun onPause() {
+        savePrefs()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        // задача продолжается в CutService, экран просто отписывается
+        Engine.unlisten(onEngine)
+        handler.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
+    // =====================================================================
+    //                              ЭКРАН
+    // =====================================================================
+    private fun section(title: String, extra: View? = null): View {
+        val r = ui.row()
+        r.addView(ui.h3(title), ui.lp(0, WRAP_CONTENT, weight = 1f))
+        if (extra != null) r.addView(extra)
+        col.addView(r, ui.lp(top = ui.dp(22), bottom = ui.dp(8)))
+        return r
+    }
+
+    private fun card(): LinearLayout = ui.card().also { col.addView(it, ui.lp(bottom = ui.dp(8))) }
+
+    private fun buildHeader() {
+        val r = ui.row()
+        val logo = ui.text("✂", 22f, ui.onAccent, true).apply {
+            gravity = Gravity.CENTER
+            background = ui.shape(ui.accent, ui.dpf(12))
+        }
+        r.addView(logo, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
+        val t = ui.column()
+        t.addView(ui.text("Dorama Cutter", 22f, bold = true))
+        t.addView(ui.text("Нарезка дорам на части для TikTok", 14f, ui.muted))
+        r.addView(t, ui.lp(0, WRAP_CONTENT, weight = 1f).apply { marginStart = ui.dp(12) })
+        col.addView(r)
+    }
+
+    private fun buildVideo() {
+        section("Видео")
+        val c = card()
+        val r = ui.row().apply { setPadding(0, ui.dp(10), 0, 0) }
+        val ic = ui.text("▶", 18f, ui.accent, true).apply {
+            gravity = Gravity.CENTER
+            background = ui.shape(ui.accentSoft, ui.dpf(12))
+        }
+        r.addView(ic, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
+        val who = ui.column()
+        videoName = ui.text("", 17f, bold = true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+        }
+        videoMeta = ui.text("", 14f, ui.muted)
+        who.addView(videoName)
+        who.addView(videoMeta)
+        r.addView(who, ui.lp(0, WRAP_CONTENT, weight = 1f).apply { marginStart = ui.dp(12) })
+        c.addView(r)
+        pickBtn = ui.button("Выбрать видео", Btn.PRIMARY) { onPickClick() }
+        c.addView(pickBtn, ui.lp(top = ui.dp(12)))
+    }
+
+    private fun buildDesign() {
+        section("Оформление")
+        val c = card()
+        titleEt = ui.field(c, "Название дорамы", prefs.getString("title", "") ?: "",
+            hintText = "Например, Как дракон влюбился")
+        tgEt = ui.field(c, "Telegram-канал", prefs.getString("tg", "") ?: "", hintText = "@my_channel")
+        tagsEt = ui.field(c, "Хештеги", prefs.getString("tags", DEFAULT_TAGS) ?: DEFAULT_TAGS,
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+        c.addView(ui.button("Скопировать хештеги", Btn.SOFT) {
+            copy(tagsEt.text.toString(), "Хештеги скопированы")
+        }, ui.lp(top = ui.dp(10)))
+    }
+
+    private fun buildCut() {
+        section("Нарезка")
+        val c = card()
+        val two = ui.row().apply { gravity = Gravity.TOP }
+        val left = ui.column()
+        val right = ui.column()
+        val num = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        maxEt = ui.field(left, "Макс. минут в части", prefs.getString("max", "60") ?: "60", num)
+        rateEt = ui.field(right, "Битрейт, Мбит/с", prefs.getString("rate", "5") ?: "5", num)
+        two.addView(left, ui.lp(0, WRAP_CONTENT, weight = 1f))
+        two.addView(right, ui.lp(0, WRAP_CONTENT, weight = 1f).apply { marginStart = ui.dp(8) })
+        c.addView(two)
+        c.addView(ui.hint("Битрейт выше — картинка лучше, но файлы тяжелее. Для TikTok хватает 4–6 Мбит/с."),
+            ui.lp(top = ui.dp(8)))
+    }
+
+    private fun buildAi() {
+        section("ИИ-анализ", ui.chip("необязательно", ui.muted, ui.line))
+        val c = card()
+        keyEt = ui.field(c, "API-ключ Gemini", prefs.getString("key", "") ?: "",
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+            "aistudio.google.com/apikey")
+        modelEt = ui.field(c, "Модель Gemini", prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL)
+        aiBtn = ui.button("Найти места для разреза", Btn.SOFT) { onAiClick() }
+        c.addView(aiBtn, ui.lp(top = ui.dp(12)))
+        c.addView(ui.hint("Звук серии (150–350 МБ) загрузится в Google — лучше по Wi-Fi. " +
+            "ИИ найдёт клиффхэнгеры, придумает заголовки, тексты финального экрана и хештеги. " +
+            "Ошибка 404 — смени модель на актуальную из AI Studio."), ui.lp(top = ui.dp(8)))
+        aiSummary = ui.text("", 15f).apply {
+            background = ui.shape(ui.accentSoft, ui.dpf(10))
+            setPadding(ui.dp(12), ui.dp(10), ui.dp(12), ui.dp(10))
+            visibility = View.GONE
+        }
+        c.addView(aiSummary, ui.lp(top = ui.dp(10)))
+    }
+
+    private fun buildPlan() {
+        planReset = ui.text("Сбросить правки", 14f, ui.accent, true).apply {
+            setPadding(ui.dp(8), ui.dp(2), 0, ui.dp(2))
+            setOnClickListener {
+                Session.manualCuts = null
+                renderPlan()
+                toast("План пересчитан автоматически")
+            }
+        }
+        section("План нарезки", planReset)
+        planInfo = ui.text("", 15f, ui.muted)
+        col.addView(planInfo, ui.lp(bottom = ui.dp(8)))
+        planBox = ui.column()
+        col.addView(planBox)
+        spaceTv = ui.text("", 14f, ui.muted)
+        col.addView(spaceTv, ui.lp(top = ui.dp(4)))
+    }
+
+    private fun buildResult() {
+        resultHead = section("Описания для TikTok")
+        resultCard = card()
+        resultTv = ui.text("", 15f).apply {
+            setTextIsSelectable(true)
+            setPadding(0, ui.dp(10), 0, 0)
+        }
+        resultCard.addView(resultTv)
+        resultCard.addView(ui.button("Скопировать все описания", Btn.SOFT) {
+            copy(resultTv.text.toString(), "Описания скопированы")
+        }, ui.lp(top = ui.dp(12)))
+        resultHead.visibility = View.GONE
+        resultCard.visibility = View.GONE
+    }
+
+    /** Нижняя панель: статус, прогресс и кнопки — всегда на экране. */
+    private fun buildBar(): View {
+        val wrap = ui.column()
+        toastTv = ui.text("", 15f, ui.bg).apply {
+            background = ui.shape(ui.ink, ui.dpf(99))
+            setPadding(ui.dp(18), ui.dp(10), ui.dp(18), ui.dp(10))
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        wrap.addView(toastTv, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            bottomMargin = ui.dp(12)
+            marginStart = ui.dp(16)
+            marginEnd = ui.dp(16)
+        })
+        val bar = ui.column().apply {
+            val r = ui.dpf(20)
+            background = GradientDrawable().apply {
+                setColor(ui.cardBg)
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+            }
+            elevation = ui.dpf(12)
+            setPadding(ui.dp(16), ui.dp(14), ui.dp(16), ui.dp(14))
+        }
+        val sr = ui.row()
+        statusTv = ui.text("", 15f).apply { maxLines = 3 }
+        pctTv = ui.text("", 16f, ui.accent, true)
+        sr.addView(statusTv, ui.lp(0, WRAP_CONTENT, weight = 1f))
+        sr.addView(pctTv, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = ui.dp(8) })
+        bar.addView(sr)
+        meter = Meter(this, ui.line, ui.accent)
+        bar.addView(meter, ui.lp(h = ui.dp(8), top = ui.dp(10)))
+        resumeBtn = ui.button("", Btn.OK) { resumable()?.let { launch(it) } }
+        bar.addView(resumeBtn, ui.lp(top = ui.dp(10)))
+        val bs = ui.row()
+        startBtn = ui.button("Начать нарезку", Btn.PRIMARY) { onStartClick() }
+        stopBtn = ui.button("Остановить", Btn.DANGER) { Engine.stop() }
+        bs.addView(startBtn, ui.lp(0, WRAP_CONTENT, weight = 1f))
+        bs.addView(stopBtn, ui.lp(0, WRAP_CONTENT, weight = 1f).apply { marginStart = ui.dp(8) })
+        bar.addView(bs, ui.lp(top = ui.dp(10)))
+        wrap.addView(bar)
+        // контент не должен прятаться под панелью
+        bar.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+            val pb = bottom - top + ui.dp(24)
+            if (col.paddingBottom != pb) col.setPadding(col.paddingLeft, col.paddingTop, col.paddingRight, pb)
+        }
+        return wrap
+    }
+
+    private fun toast(msg: String) {
+        handler.removeCallbacks(hideToast)
+        toastTv.animate().cancel()
+        toastTv.text = msg
+        toastTv.visibility = View.VISIBLE
+        toastTv.alpha = 0f
+        toastTv.translationY = ui.dpf(20)
+        toastTv.animate().alpha(1f).translationY(0f).setDuration(250).start()
+        handler.postDelayed(hideToast, 2500)
+    }
+
+    private fun copy(text: String, msg: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("text", text))
+        toast(msg)
+    }
+
+    /** Нижняя шторка в стиле LOGOPED. [onOk] возвращает текст ошибки или null, если всё хорошо. */
+    private inner class Sheet(title: String) {
+        val dlg = Dialog(this@MainActivity)
+        val body: LinearLayout = ui.column()
+        private val err = ui.text("", 14f, ui.bad).apply { visibility = View.GONE }
+
+        init {
+            val box = ui.column().apply {
+                val r = ui.dpf(20)
+                background = GradientDrawable().apply {
+                    setColor(ui.cardBg)
+                    cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+                }
+                setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(20))
+            }
+            val grab = View(this@MainActivity).apply { background = ui.shape(ui.line, ui.dpf(3)) }
+            box.addView(grab, LinearLayout.LayoutParams(ui.dp(40), ui.dp(5)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = ui.dp(12)
+            })
+            box.addView(ui.text(title, 20f, bold = true))
+            box.addView(body)
+            box.addView(err, ui.lp(top = ui.dp(10)))
+            dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+            dlg.setContentView(ScrollView(this@MainActivity).apply { addView(box) })
+            dlg.window?.apply {
+                setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                decorView.setPadding(0, 0, 0, 0)
+                setLayout(MATCH_PARENT, WRAP_CONTENT)
+                setGravity(Gravity.BOTTOM)
+                setWindowAnimations(android.R.style.Animation_InputMethod)
+                setDimAmount(0.4f)
+                setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            }
+        }
+
+        fun show(cancel: String, ok: String, okStyle: Btn = Btn.PRIMARY, onOk: () -> String?) {
+            val r = ui.row()
+            r.addView(ui.button(cancel, Btn.PLAIN) { dlg.dismiss() }, ui.lp(0, WRAP_CONTENT, weight = 1f))
+            r.addView(ui.button(ok, okStyle) {
+                val e = onOk()
+                if (e == null) dlg.dismiss() else { err.text = e; err.visibility = View.VISIBLE }
+            }, ui.lp(0, WRAP_CONTENT, weight = 1f).apply { marginStart = ui.dp(8) })
+            body.addView(r, ui.lp(top = ui.dp(16)))
+            dlg.show()
+        }
+    }
+
+    // =====================================================================
+    //                              ВИДЕО
+    // =====================================================================
     private fun onPickClick() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -191,569 +388,319 @@ class MainActivity : Activity() {
     }
 
     private fun onPicked(uri: Uri) {
-        srcUri = uri
-        hooks = emptyList()
-        firstHook = null
+        // доступ к файлу нужен и сервису, даже если экран закроют
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+        }
+        Session.uri = uri
+        Session.hooks = emptyList()
+        Session.firstHook = null
+        Session.summary = ""
+        Session.manualCuts = null
+        Session.name = "video"
         contentResolver.query(uri, null, null, null, null)?.use { c ->
             val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (i >= 0 && c.moveToFirst()) {
-                baseName = c.getString(i).substringBeforeLast('.')
-                    .replace(Regex("[^\\p{L}\\p{N}_-]+"), "_")
-            }
+            if (i >= 0 && c.moveToFirst()) Session.name = c.getString(i)
         }
+        Session.baseName = Session.name.substringBeforeLast('.')
+            .replace(Regex("[^\\p{L}\\p{N}_-]+"), "_")
         val r = MediaMetadataRetriever()
-        durMs = try {
+        try {
             r.setDataSource(this, uri)
-            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            fun num(k: Int) = r.extractMetadata(k)?.toLongOrNull() ?: 0L
+            Session.durMs = num(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            val w = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val h = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val rot = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+            Session.landscape = if (rot == 90L || rot == 270L) h >= w else w >= h
         } catch (e: Exception) {
-            0L
+            Session.durMs = 0L
         } finally {
             r.release()
         }
-        if (durMs <= 0) statusTv.text = "Не удалось прочитать длительность видео"
-        showPlan()
+        if (Session.durMs <= 0) toast("Не удалось прочитать длительность видео")
+        aiSummary.visibility = View.GONE
+        renderVideo()
+        renderPlan()
     }
 
-    // ---------- план частей ----------
-    private fun planParts(): List<Part> {
-        val maxMin = maxEt.text.toString().replace(',', '.').toDoubleOrNull() ?: 60.0
-        // интро накладывается поверх видео и времени не добавляет; 1 с запаса до лимита
-        val maxMs = ((maxMin * 60_000).toLong() - 1000).coerceAtLeast(60_000)
-        val r = ArrayList<Part>()
-        var p = 0L
-        var hook = firstHook
-        while (p < durMs) {
-            if (durMs - p <= maxMs) {
-                r.add(Part(p, durMs, hook, null))
-                break
-            }
-            val limit = p + maxMs
-            val c = hooks
-                .filter { it.tMs > p + 60_000 && it.tMs in (limit - WINDOW_MS)..limit }
-                .sortedWith(compareBy({ it.score }, { it.tMs }))
-                .lastOrNull()
-            val e = c?.tMs ?: limit
-            r.add(Part(p, e, hook, c?.teaser?.ifBlank { null }))
-            hook = c?.nextHook?.ifBlank { null }
-            p = e
+    private fun renderVideo() {
+        if (Session.uri == null) {
+            videoName.text = "Видео не выбрано"
+            videoMeta.text = "Выбери серию из галереи или файлов"
+            pickBtn.text = "Выбрать видео"
+            ui.style(pickBtn, Btn.PRIMARY)
+        } else {
+            videoName.text = Session.name
+            videoMeta.text = fmt(Session.durMs) + " · " +
+                if (Session.landscape) "горизонтальное, повернём в 9:16" else "вертикальное, без поворота"
+            pickBtn.text = "Выбрать другое видео"
+            ui.style(pickBtn, Btn.SOFT)
         }
+        if (Session.summary.isNotEmpty()) {
+            aiSummary.text = "О чём серия: ${Session.summary}\n\nКлиффхэнгеров найдено: ${Session.hooks.size}"
+            aiSummary.visibility = View.VISIBLE
+        }
+    }
+
+    // =====================================================================
+    //                              ПЛАН
+    // =====================================================================
+    private fun maxMs(): Long {
+        val m = maxEt.text.toString().replace(',', '.').toDoubleOrNull() ?: 60.0
+        // интро накладывается поверх видео и времени не добавляет; 1 с запаса до лимита
+        return ((m * 60_000).toLong() - 1000).coerceAtLeast(60_000)
+    }
+
+    private fun mbps(): Double =
+        (rateEt.text.toString().replace(',', '.').toDoubleOrNull() ?: 5.0).coerceIn(0.5, 50.0)
+
+    private fun cuts(): List<Cut> = Session.manualCuts ?: autoCuts(Session.durMs, maxMs(), Session.hooks)
+
+    private fun currentParts(): List<Part> =
+        if (Session.durMs <= 0) emptyList() else partsFrom(Session.durMs, cuts(), Session.firstHook)
+
+    private fun partsWord(n: Int) = when {
+        n % 10 == 1 && n % 100 != 11 -> "часть"
+        n % 10 in 2..4 && n % 100 !in 12..14 -> "части"
+        else -> "частей"
+    }
+
+    private fun renderPlan() {
+        planBox.removeAllViews()
+        planReset.visibility = if (Session.manualCuts != null) View.VISIBLE else View.GONE
+        val parts = currentParts()
+        if (parts.isEmpty()) {
+            planInfo.visibility = View.GONE
+            planBox.addView(ui.text("Выбери видео — здесь появится план частей", 16f, ui.muted).apply {
+                gravity = Gravity.CENTER
+                setPadding(ui.dp(16), ui.dp(30), ui.dp(16), ui.dp(30))
+            })
+            renderSpace()
+            renderEngine()
+            return
+        }
+        val notes = listOfNotNull(
+            if (Session.hooks.isNotEmpty()) "с подсказками ИИ" else null,
+            if (Session.manualCuts != null) "есть ручные правки" else null
+        )
+        planInfo.text = "${parts.size} ${partsWord(parts.size)} · ${fmt(Session.durMs)}" +
+            notes.joinToString("") { " · $it" }
+        planInfo.visibility = View.VISIBLE
+        parts.forEachIndexed { i, p -> planBox.addView(partRow(i, p, parts.size), ui.lp(bottom = ui.dp(8))) }
+        planBox.addView(ui.hint("Нажми на часть, чтобы поправить точку разреза или тексты."))
+        renderSpace()
+        renderEngine()
+    }
+
+    private fun partRow(i: Int, p: Part, n: Int): View {
+        val over = p.b - p.a > maxMs() + 1000
+        val r = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12))
+            background = ui.ripple(ui.cardBg, ui.dpf(14), 1, ui.border)
+            elevation = if (ui.dark) 0f else ui.dpf(1)
+            setOnClickListener { editPart(i) }
+        }
+        val t = ui.column().apply { minimumWidth = ui.dp(64) }
+        t.addView(ui.text(fmt(p.a), 16f, bold = true))
+        t.addView(ui.text("${(p.b - p.a + 30_000) / 60_000} мин", 13f, ui.muted))
+        r.addView(t)
+        val barColor = when {
+            over -> ui.bad
+            p.manual -> ui.warn
+            p.fromAi -> ui.accent
+            else -> ui.line
+        }
+        r.addView(View(this).apply { background = ui.shape(barColor, ui.dpf(3)) },
+            LinearLayout.LayoutParams(ui.dp(5), MATCH_PARENT).apply {
+                marginStart = ui.dp(6)
+                marginEnd = ui.dp(12)
+            })
+        val who = ui.column()
+        who.addView(ui.text("Часть ${i + 1}" + if (i == n - 1 && n > 1) " · финал" else "", 17f, bold = true))
+        who.addView(ui.text("${fmt(p.a)} – ${fmt(p.b)}", 14f, ui.muted))
+        p.hook?.let { who.addView(ui.text("🔥 $it", 14f), ui.lp(top = ui.dp(4))) }
+        p.teaser?.let { who.addView(ui.text("→ ${it.uppercase()}", 14f, ui.accent, true), ui.lp(top = ui.dp(2))) }
+        r.addView(who, ui.lp(0, WRAP_CONTENT, weight = 1f))
+        val chip = when {
+            over -> ui.chip("> лимита", ui.bad, ui.badSoft)
+            p.manual -> ui.chip("вручную", ui.warn, ui.warnSoft)
+            p.fromAi -> ui.chip("ИИ", ui.accent, ui.accentSoft)
+            else -> null
+        }
+        if (chip != null) r.addView(chip, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            marginStart = ui.dp(8)
+        })
         return r
     }
 
-    private fun showPlan() {
-        if (durMs <= 0) { infoTv.text = "Видео не выбрано"; return }
-        val p = planParts()
-        val ai = if (hooks.isNotEmpty()) " (с подсказками ИИ)" else ""
-        infoTv.text = "Видео ${fmt(durMs)} → частей: ${p.size}$ai\n" +
-            p.mapIndexed { i, x ->
-                "Часть ${i + 1}: ${fmt(x.a)}–${fmt(x.b)}" + (x.teaser?.let { "  → $it" } ?: "")
-            }.joinToString("\n")
+    private fun editPart(i: Int) {
+        if (Engine.kind != Engine.Kind.IDLE) { toast("Дождись окончания текущей задачи"); return }
+        val parts = currentParts()
+        val p = parts[i]
+        val n = parts.size
+        val last = i == n - 1
+        val s = Sheet("Часть ${i + 1} из $n")
+        s.body.addView(ui.text("${fmt(p.a)} – ${fmt(p.b)}", 15f, ui.muted))
+        val endEt = if (!last) ui.field(s.body, "Конец части (ч:мм:сс)", fmt(p.b)) else null
+        val hookEt = ui.field(s.body, "Заголовок в начале части", p.hook ?: "", hintText = "до 7 слов")
+        val teaserEt = if (!last) ui.field(s.body, "Текст финального экрана", p.teaser ?: "",
+            hintText = "до 6 слов, интригующий") else null
+        if (last) s.body.addView(ui.hint("Последняя часть: на финальном экране будет Telegram-канал " +
+            "или «Больше дорам в профиле»."), ui.lp(top = ui.dp(10)))
+        s.show("Отмена", "Сохранить") {
+            val auto = cuts()
+            val cs = auto.toMutableList()
+            if (endEt != null && teaserEt != null) {
+                val t = parseTime(endEt.text.toString()) ?: return@show "Время пиши как ч:мм:сс, например 0:58:40"
+                val lo = p.a + 60_000
+                val hi = (if (i + 1 < cs.size) cs[i + 1].tMs else Session.durMs) - 60_000
+                if (t !in lo..hi) return@show "Конец части должен быть между ${fmt(lo)} и ${fmt(hi)}"
+                val old = cs[i]
+                val teaser = teaserEt.text.toString().trim().ifEmpty { null }
+                if (t != old.tMs || teaser != old.teaser) cs[i] = old.copy(tMs = t, teaser = teaser, manual = true)
+            }
+            val hook = hookEt.text.toString().trim().ifEmpty { null }
+            if (i == 0) Session.firstHook = hook
+            else if (hook != cs[i - 1].nextHook) cs[i - 1] = cs[i - 1].copy(nextHook = hook)
+            if (cs != auto) Session.manualCuts = cs
+            renderPlan()
+            toast("Часть ${i + 1} обновлена")
+            null
+        }
     }
 
-    private fun fmt(ms: Long): String {
-        val s = ms / 1000
-        return String.format(Locale.US, "%d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60)
+    private class Estimate(val total: Long, val maxPart: Long)
+
+    private fun estimate(parts: List<Part>, from: Int): Estimate {
+        val bytesPerMs = (mbps() * 1_000_000 + 160_000) / 8 / 1000
+        val sizes = parts.drop(from).map { ((it.b - it.a) * bytesPerMs).toLong() }
+        return Estimate(sizes.sum(), sizes.maxOrNull() ?: 0L)
     }
 
-    // ---------- состояние ----------
-    private fun setRunning(b: Boolean) {
-        running = b
-        pickBtn.isEnabled = !b
-        startBtn.isEnabled = !b
-        aiBtn.isEnabled = !b
-        stopBtn.isEnabled = b
+    private fun freeBytes(): Long = try {
+        StatFs(Environment.getExternalStorageDirectory().path).availableBytes
+    } catch (e: Exception) {
+        Long.MAX_VALUE
     }
 
-    private fun fail(msg: String) {
-        transformer = null
-        aiMode = false
-        handler.removeCallbacks(poll)
-        setRunning(false)
-        statusTv.text = "Ошибка: $msg"
-    }
+    private fun gb(b: Long) = String.format(Locale("ru"), "%.1f ГБ", b / 1e9)
 
-    private fun onStopClick() {
-        cancelled = true
-        transformer?.cancel()
-        transformer = null
-        aiMode = false
-        handler.removeCallbacks(poll)
-        setRunning(false)
-        statusTv.text = "Остановлено"
+    private fun renderSpace() {
+        val parts = currentParts()
+        if (parts.isEmpty()) { spaceTv.visibility = View.GONE; return }
+        val e = estimate(parts, 0)
+        val free = freeBytes()
+        spaceTv.visibility = View.VISIBLE
+        spaceTv.text = "Нужно ≈ ${gb(e.total)} в галерее (+${gb(e.maxPart)} временно) · свободно ${gb(free)}"
+        spaceTv.setTextColor(if (e.total + e.maxPart > free) ui.bad else ui.muted)
     }
-
-    private fun ui(msg: String) = runOnUiThread { if (!cancelled) statusTv.text = msg }
 
     // =====================================================================
-    //                          ИИ-АНАЛИЗ (Gemini)
+    //                              ЗАДАЧИ
     // =====================================================================
+    private fun savePrefs() {
+        prefs.edit()
+            .putString("title", titleEt.text.toString().trim())
+            .putString("tg", tgEt.text.toString().trim())
+            .putString("tags", tagsEt.text.toString().trim())
+            .putString("max", maxEt.text.toString().trim())
+            .putString("rate", rateEt.text.toString().trim())
+            .putString("key", keyEt.text.toString().trim())
+            .putString("model", modelEt.text.toString().trim())
+            .apply()
+    }
+
+    private fun askNotifications() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
+    }
+
     private fun onAiClick() {
+        val uri = Session.uri
+        if (uri == null || Session.durMs <= 0) { toast("Сначала выбери видео"); return }
         val key = keyEt.text.toString().trim()
-        val uri = srcUri
-        if (uri == null || durMs <= 0) { statusTv.text = "Сначала выбери видео"; return }
-        if (key.isEmpty()) { statusTv.text = "Вставь API-ключ Gemini"; return }
-        getSharedPreferences("s", MODE_PRIVATE).edit()
-            .putString("key", key).putString("model", modelEt.text.toString().trim()).apply()
-        cancelled = false
-        setRunning(true)
-        aiMode = true
-        bar.progress = 0
-        statusTv.text = "ИИ 1/4: достаю звук..."
-        val out = File(cacheDir, "audio.mp4")
-        if (out.exists()) out.delete()
-        val edited = EditedMediaItem.Builder(MediaItem.fromUri(uri)).setRemoveVideo(true).build()
-        val tr = Transformer.Builder(this)
-            .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    transformer = null
-                    aiMode = false
-                    handler.removeCallbacks(poll)
-                    Thread { runAi(out, key) }.start()
-                }
-
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    fail("звук: ${exportException.message} (код ${exportException.errorCode})")
-                }
-            })
-            .build()
-        transformer = tr
-        try {
-            tr.start(edited, out.absolutePath)
-        } catch (e: Exception) {
-            fail("${e.message}")
-            return
-        }
-        handler.removeCallbacks(poll)
-        handler.post(poll)
+        if (key.isEmpty()) { toast("Вставь API-ключ Gemini"); return }
+        savePrefs()
+        askNotifications()
+        val model = modelEt.text.toString().trim().ifEmpty { DEFAULT_MODEL }
+        Engine.startAi(this, AiJob(uri, key, model, Session.durMs))
     }
 
-    private fun runAi(src: File, key: String) {
-        try {
-            ui("ИИ 2/4: готовлю звук...")
-            val aac = File(cacheDir, "audio.aac")
-            toAdts(src, aac)
-            src.delete()
-            ui("ИИ 3/4: загружаю звук в Google (${aac.length() / 1_000_000} МБ), лучше по Wi-Fi...")
-            val model = modelEt.text.toString().trim().ifEmpty { "gemini-3.5-flash" }
-            val fileUri = uploadFile(aac, key)
-            aac.delete()
-            ui("ИИ 4/4: анализирую серию (1–5 минут)...")
-            val answer = generate(fileUri, key, model)
-            runOnUiThread { if (!cancelled) applyAi(answer) }
-        } catch (e: Exception) {
-            runOnUiThread { if (!cancelled) fail("ИИ: ${e.message}") }
-        }
+    private fun applyAi(r: AiResult) {
+        Session.hooks = r.hooks
+        Session.firstHook = r.firstHook
+        Session.summary = r.summary
+        Session.manualCuts = null
+        r.tags?.let { tagsEt.setText(it) }
+        renderVideo()
+        renderPlan()
+        toast("ИИ подготовил план нарезки")
     }
 
-    /** Превращает AAC из mp4-контейнера в поток ADTS (.aac), который принимает Gemini. */
-    private fun toAdts(src: File, dst: File) {
-        val ex = MediaExtractor()
-        ex.setDataSource(src.absolutePath)
-        var idx = -1
-        var fmt: MediaFormat? = null
-        for (i in 0 until ex.trackCount) {
-            val f = ex.getTrackFormat(i)
-            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) { idx = i; fmt = f; break }
-        }
-        if (idx < 0 || fmt == null) throw Exception("в видео нет звуковой дорожки")
-        ex.selectTrack(idx)
-        val csd = fmt.getByteBuffer("csd-0") ?: throw Exception("не удалось прочитать параметры звука")
-        val b0 = csd.get(0).toInt() and 0xFF
-        val b1 = csd.get(1).toInt() and 0xFF
-        val aot = b0 shr 3
-        val freq = ((b0 and 7) shl 1) or (b1 shr 7)
-        val ch = (b1 shr 3) and 0xF
-        val buf = ByteBuffer.allocate(1 shl 18)
-        dst.outputStream().buffered().use { o ->
-            while (true) {
-                buf.clear()
-                val n = ex.readSampleData(buf, 0)
-                if (n < 0) break
-                val len = n + 7
-                val h = ByteArray(7)
-                h[0] = 0xFF.toByte()
-                h[1] = 0xF1.toByte()
-                h[2] = ((((aot - 1) and 3) shl 6) or (freq shl 2) or (ch shr 2)).toByte()
-                h[3] = (((ch and 3) shl 6) or (len shr 11)).toByte()
-                h[4] = ((len shr 3) and 0xFF).toByte()
-                h[5] = (((len and 7) shl 5) or 0x1F).toByte()
-                h[6] = 0xFC.toByte()
-                val arr = ByteArray(n)
-                buf.position(0)
-                buf.limit(n)
-                buf.get(arr, 0, n)
-                o.write(h)
-                o.write(arr)
-                ex.advance()
-            }
-        }
-        ex.release()
-    }
-
-    private fun errText(c: HttpURLConnection): String =
-        try { c.errorStream?.bufferedReader()?.readText() ?: c.responseMessage } catch (e: Exception) { "HTTP ${c.responseCode}" }
-
-    private fun uploadFile(f: File, key: String): String {
-        val start = URL("$GEMINI/upload/v1beta/files").openConnection() as HttpURLConnection
-        start.requestMethod = "POST"
-        start.doOutput = true
-        start.setRequestProperty("x-goog-api-key", key)
-        start.setRequestProperty("X-Goog-Upload-Protocol", "resumable")
-        start.setRequestProperty("X-Goog-Upload-Command", "start")
-        start.setRequestProperty("X-Goog-Upload-Header-Content-Length", f.length().toString())
-        start.setRequestProperty("X-Goog-Upload-Header-Content-Type", "audio/aac")
-        start.setRequestProperty("Content-Type", "application/json")
-        start.outputStream.use { it.write("{\"file\":{\"display_name\":\"dorama\"}}".toByteArray()) }
-        if (start.responseCode !in 200..299) throw Exception("загрузка: ${errText(start)}")
-        val upUrl = start.getHeaderField("X-Goog-Upload-URL") ?: throw Exception("нет адреса загрузки")
-        start.disconnect()
-
-        val c = URL(upUrl).openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
-        c.doOutput = true
-        c.connectTimeout = 30_000
-        c.readTimeout = 600_000
-        c.setFixedLengthStreamingMode(f.length())
-        c.setRequestProperty("X-Goog-Upload-Offset", "0")
-        c.setRequestProperty("X-Goog-Upload-Command", "upload, finalize")
-        c.outputStream.use { o -> f.inputStream().use { it.copyTo(o, 64 * 1024) } }
-        if (c.responseCode !in 200..299) throw Exception("загрузка: ${errText(c)}")
-        val file = JSONObject(c.inputStream.bufferedReader().readText()).getJSONObject("file")
-        val name = file.getString("name")
-        val uri = file.getString("uri")
-        var state = file.optString("state")
-        var tries = 0
-        while (state != "ACTIVE" && tries++ < 120) {
-            if (state == "FAILED") throw Exception("Google не смог обработать звук")
-            Thread.sleep(5000)
-            val g = URL("$GEMINI/v1beta/$name").openConnection() as HttpURLConnection
-            g.setRequestProperty("x-goog-api-key", key)
-            state = JSONObject(g.inputStream.bufferedReader().readText()).optString("state")
-        }
-        if (state != "ACTIVE") throw Exception("звук не обработан за отведённое время")
-        return uri
-    }
-
-    private fun prompt(): String = """
-Это аудио китайской дорамы с русской озвучкой, длительность ${fmt(durMs)}.
-Время везде указывай в формате ЧЧ:ММ:СС от начала файла.
-Задача: подготовить нарезку для TikTok (зритель досматривает часть и идёт за продолжением).
-1) Найди 20-40 сильных клиффхэнгеров по ВСЕЙ серии: оборванная фраза, поворот сюжета, раскрытие тайны, конфликт на пике. Не реже одного примерно каждые 10 минут. Время ставь точно на конец реплики, в паузе речи, до начала следующей реплики.
-2) Для каждого: t (время), score (1-10: насколько зритель захочет продолжить), teaser (текст финального экрана, до 6 слов, ЗАГЛАВНЫМИ, интригующий, без спойлера), next_hook (заголовок для начала следующей части, до 7 слов).
-3) first_hook: заголовок для начала первой части (до 7 слов).
-4) hashtags: 7 хештегов под жанр и сюжет (русские и 1-2 английских).
-5) summary: 2 предложения о сюжете.
-Верни ТОЛЬКО JSON без пояснений и без markdown:
-{"summary":"...","first_hook":"...","hashtags":["#..."],"cliffhangers":[{"t":"00:12:34","score":8,"teaser":"...","next_hook":"..."}]}
-""".trimIndent()
-
-    private fun generate(fileUri: String, key: String, model: String): String {
-        val body = JSONObject()
-            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
-                .put(JSONObject().put("file_data",
-                    JSONObject().put("mime_type", "audio/aac").put("file_uri", fileUri)))
-                .put(JSONObject().put("text", prompt())))))
-            .put("generationConfig",
-                JSONObject().put("responseMimeType", "application/json").put("temperature", 0.3))
-        val c = URL("$GEMINI/v1beta/models/$model:generateContent").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
-        c.doOutput = true
-        c.connectTimeout = 30_000
-        c.readTimeout = 900_000
-        c.setRequestProperty("x-goog-api-key", key)
-        c.setRequestProperty("Content-Type", "application/json")
-        c.outputStream.use { it.write(body.toString().toByteArray()) }
-        if (c.responseCode !in 200..299) throw Exception("анализ: ${errText(c)}")
-        val resp = JSONObject(c.inputStream.bufferedReader().readText())
-        val parts = resp.getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts")
-        val sb = StringBuilder()
-        for (i in 0 until parts.length()) {
-            val p = parts.getJSONObject(i)
-            if (!p.optBoolean("thought", false)) sb.append(p.optString("text"))
-        }
-        return sb.toString()
-    }
-
-    private fun parseTime(s: String): Long? {
-        val x = s.trim().split(":").map { it.trim().toDoubleOrNull() ?: return null }
-        val sec = when (x.size) {
-            3 -> x[0] * 3600 + x[1] * 60 + x[2]
-            2 -> x[0] * 60 + x[1]
-            else -> return null
-        }
-        return (sec * 1000).toLong()
-    }
-
-    private fun applyAi(answer: String) {
-        try {
-            val clean = answer.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-            val o = JSONObject(clean)
-            firstHook = o.optString("first_hook").trim().ifEmpty { null }
-            aiSummary = o.optString("summary").trim()
-            val list = ArrayList<Hook>()
-            val arr = o.optJSONArray("cliffhangers")
-            if (arr != null) for (i in 0 until arr.length()) {
-                val h = arr.getJSONObject(i)
-                val t = parseTime(h.optString("t")) ?: continue
-                if (t < 60_000 || t > durMs - 60_000) continue
-                list.add(Hook(t, h.optInt("score", 5),
-                    h.optString("teaser").trim().take(48), h.optString("next_hook").trim()))
-            }
-            hooks = list.sortedBy { it.tMs }
-            val tagsArr = o.optJSONArray("hashtags")
-            if (tagsArr != null && tagsArr.length() > 0) {
-                val tags = (0 until tagsArr.length()).map { tagsArr.getString(it).trim() }
-                    .filter { it.isNotEmpty() }
-                    .joinToString(" ") { if (it.startsWith("#")) it else "#$it" }
-                if (tags.isNotEmpty()) tagsEt.setText(tags)
-            }
-            showPlan()
-            resultTv.text = "О чём серия: $aiSummary\n\nНайдено клиффхэнгеров: ${hooks.size}\n" +
-                hooks.joinToString("\n") { "${fmt(it.tMs)}  [${it.score}/10]  ${it.teaser}" }
-            statusTv.text = "ИИ готов. Проверь план выше и жми «Начать нарезку»."
-            bar.progress = 0
-            setRunning(false)
-        } catch (e: Exception) {
-            fail("не удалось разобрать ответ ИИ: ${e.message}")
-        }
-    }
-
-    // =====================================================================
-    //                          НАРЕЗКА ВИДЕО
-    // =====================================================================
     private fun onStartClick() {
-        if (srcUri == null || durMs <= 0) { statusTv.text = "Сначала выбери видео"; return }
-        cancelled = false
-        parts = planParts()
-        showPlan()
-        resultTv.text = ""
-        bar.progress = 0
-        setRunning(true)
-        startPart(0)
+        val parts = currentParts()
+        if (parts.isEmpty()) { toast("Сначала выбери видео"); return }
+        savePrefs()
+        val e = estimate(parts, 0)
+        val free = freeBytes()
+        if (e.total + e.maxPart > free) {
+            val s = Sheet("Может не хватить места")
+            s.body.addView(ui.text("Для всех частей нужно примерно ${gb(e.total + e.maxPart)}, " +
+                "а свободно ${gb(free)}. Уменьши битрейт или освободи место.", 16f), ui.lp(top = ui.dp(8)))
+            s.show("Отмена", "Всё равно начать") { launch(0); null }
+        } else {
+            launch(0)
+        }
     }
 
-    private fun startPart(idx: Int) {
-        curIdx = idx
-        val p = parts[idx]
-        val n = parts.size
-        val tg = tgEt.text.toString().trim()
-        val next = "ЧАСТЬ ${idx + 2} — В ПРОФИЛЕ"
-        val end1: String
-        var end2: String? = null
-        when {
-            idx < n - 1 && p.teaser != null -> { end1 = p.teaser.uppercase(); end2 = next }
-            idx < n - 1 -> end1 = next
-            tg.isNotEmpty() -> end1 = "ПОЛНАЯ ВЕРСИЯ — $tg"
-            else -> end1 = "БОЛЬШЕ ДОРАМ В ПРОФИЛЕ"
-        }
-        val overlay = PartOverlay(
-            intro = makeBitmap(idx + 1, n, null, null, p.hook, true),
-            main = makeBitmap(idx + 1, n, null, null, null, false),
-            end = makeBitmap(idx + 1, n, end1, end2, null, false),
-            introEndUs = INTRO_S * 1_000_000L,
-            endStartUs = (p.b - p.a) * 1000L - END_S * 1_000_000L
-        )
-        val fx = listOf<Effect>(
-            // 270° против часовой = 90° по часовой, как в версии для ПК
-            ScaleAndRotateTransformation.Builder().setRotationDegrees(270f).build(),
-            Presentation.createForWidthAndHeight(1080, 1920, Presentation.LAYOUT_SCALE_TO_FIT),
-            OverlayEffect(ImmutableList.of<TextureOverlay>(overlay))
-        )
-        val item = MediaItem.Builder()
-            .setUri(srcUri)
-            .setClippingConfiguration(
-                MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(p.a)
-                    .setEndPositionMs(p.b)
-                    .build()
-            )
-            .build()
-        val edited = EditedMediaItem.Builder(item).setEffects(Effects(emptyList(), fx)).build()
-        val out = File(cacheDir, "part.mp4")
-        if (out.exists()) out.delete()
+    private fun launch(from: Int) {
+        val uri = Session.uri ?: return
+        askNotifications()
+        Engine.startCut(this, CutJob(
+            uri, Session.baseName, currentParts(), from, Session.landscape, mbps(),
+            titleEt.text.toString().trim(), tgEt.text.toString().trim(), tagsEt.text.toString().trim()
+        ))
+    }
 
-        val tr = Transformer.Builder(this)
-            .setVideoMimeType(MimeTypes.VIDEO_H264)
-            .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    saveAndNext(idx, out)
-                }
+    /** С какой части можно продолжить: только то же видео и тот же план. */
+    private fun resumable(): Int? {
+        val j = Engine.lastJob ?: return null
+        val from = Engine.resumeFrom ?: return null
+        if (j.uri != Session.uri || j.parts != currentParts()) return null
+        return from
+    }
 
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    fail("часть ${idx + 1}: ${exportException.message} (код ${exportException.errorCode})")
-                }
-            })
-            .build()
-        transformer = tr
-        try {
-            tr.start(edited, out.absolutePath)
-        } catch (e: Exception) {
-            fail("${e.message}")
+    private fun renderEngine() {
+        Engine.aiResult?.let {
+            Engine.aiResult = null
+            applyAi(it)
             return
         }
-        handler.removeCallbacks(poll)
-        handler.post(poll)
-    }
-
-    private val poll = object : Runnable {
-        override fun run() {
-            val t = transformer ?: return
-            val h = ProgressHolder()
-            if (t.getProgress(h) == Transformer.PROGRESS_STATE_AVAILABLE) {
-                if (aiMode) {
-                    bar.progress = h.progress
-                    statusTv.text = "ИИ 1/4: достаю звук: ${h.progress}%"
-                } else {
-                    bar.progress = (curIdx * 100 + h.progress) / parts.size
-                    statusTv.text = "Часть ${curIdx + 1} из ${parts.size}: ${h.progress}%"
-                }
-            }
-            handler.postDelayed(this, 500)
-        }
-    }
-
-    private fun saveAndNext(idx: Int, f: File) {
-        transformer = null
-        handler.removeCallbacks(poll)
-        statusTv.text = "Сохраняю часть ${idx + 1}..."
-        Thread {
-            try {
-                val num = (idx + 1).toString().padStart(2, '0')
-                val v = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "${baseName}_part$num.mp4")
-                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/DoramaCutter")
-                }
-                val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
-                    ?: throw Exception("не удалось создать файл в галерее")
-                contentResolver.openOutputStream(uri)!!.use { o ->
-                    f.inputStream().use { it.copyTo(o) }
-                }
-                f.delete()
-                runOnUiThread {
-                    if (running) {
-                        if (idx + 1 < parts.size) startPart(idx + 1) else allDone()
-                    }
-                }
-            } catch (e: Exception) {
-                runOnUiThread { fail("сохранение: ${e.message}") }
-            }
-        }.start()
-    }
-
-    // ---------- описания и хештеги ----------
-    private fun caption(i: Int, n: Int): String {
-        val title = titleEt.text.toString().trim()
-        val tg = tgEt.text.toString().trim()
-        val head = if (title.isNotEmpty()) "$title | Часть $i/$n" else "Часть $i/$n"
-        val hook = parts.getOrNull(i - 1)?.hook
-        val sb = StringBuilder(head)
-        if (i == n) sb.append(" (финал)")
-        if (hook != null) sb.append("\n🔥 ").append(hook)
-        sb.append("\n")
-        if (i < n) sb.append("\n👉 Следующая часть в профиле")
-        if (tg.isNotEmpty()) sb.append("\n📲 Полная версия и новые дорамы в Telegram: ").append(tg)
-        sb.append("\n\n").append(tagsEt.text.toString().trim())
-        return sb.toString()
-    }
-
-    private fun allDone() {
-        val n = parts.size
-        val text = (1..n).joinToString("\n\n------------\n\n") { "=== ЧАСТЬ $it ===\n" + caption(it, n) }
-        resultTv.text = "Хештеги: ${tagsEt.text}\n\n$text"
-        try {
-            val v = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, "${baseName}_описания.txt")
-                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-                put(MediaStore.Downloads.RELATIVE_PATH, "Download/DoramaCutter")
-            }
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
-            if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
-        } catch (e: Exception) {
-            // описания всё равно видны на экране
-        }
-        bar.progress = 100
-        statusTv.text = "Готово! Видео: Movies/DoramaCutter, описания: Download/DoramaCutter"
-        setRunning(false)
-    }
-
-    // ---------- рисование накладок (кадр 1080x1920) ----------
-    /** Рисует плашку с текстом, возвращает Y её нижнего края. */
-    private fun box(c: Canvas, text: String, size: Float, bg: Int, x: Float, top: Float, centered: Boolean): Float {
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = size
-            color = Color.WHITE
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        val pad = size * 0.3f
-        val w = p.measureText(text)
-        val fm = p.fontMetrics
-        val left = if (centered) x - w / 2 - pad else x
-        val bottom = top + (fm.descent - fm.ascent) + 2 * pad
-        c.drawRect(left, top, left + w + 2 * pad, bottom, Paint().apply { color = bg })
-        c.drawText(text, left + pad, top + pad - fm.ascent, p)
-        return bottom
-    }
-
-    private fun wrap(text: String, size: Float, maxW: Float): List<String> {
-        val p = Paint().apply { textSize = size; typeface = Typeface.DEFAULT_BOLD }
-        val lines = ArrayList<String>()
-        var cur = ""
-        for (w in text.split(" ").filter { it.isNotEmpty() }) {
-            val t = if (cur.isEmpty()) w else "$cur $w"
-            if (cur.isEmpty() || p.measureText(t) <= maxW) cur = t else { lines.add(cur); cur = w }
-        }
-        if (cur.isNotEmpty()) lines.add(cur)
-        return lines
-    }
-
-    /** Слой в горизонтальных координатах 1920x1080, повёрнутый так же, как видео. */
-    private fun landscapeLayer(c: Canvas, i: Int, n: Int, end1: String?, end2: String?) {
-        c.save()
-        c.translate(1080f, 0f)
-        c.rotate(90f)
-        box(c, "ЧАСТЬ $i/$n", 54f, Color.argb(140, 0, 0, 0), 40f, 40f, false)
-        val red = Color.argb(217, 230, 46, 77)
-        if (end1 != null && end2 != null) {
-            val b = box(c, end1, 58f, red, 960f, 790f, true)
-            box(c, end2, 44f, red, 960f, b + 12f, true)
-        } else if (end1 != null) {
-            box(c, end1, 58f, red, 960f, 880f, true)
-        }
-        c.restore()
-    }
-
-    private fun makeBitmap(i: Int, n: Int, end1: String?, end2: String?, hook: String?, intro: Boolean): Bitmap {
-        val bmp = Bitmap.createBitmap(1080, 1920, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        if (intro) {
-            c.drawColor(Color.argb(140, 0, 0, 0))
-            var y = box(c, "ПОВЕРНИТЕ ЭКРАН", 84f, Color.argb(230, 230, 46, 77), 540f, 810f, true) + 20f
-            y = box(c, "Часть $i из $n", 44f, Color.argb(180, 0, 0, 0), 540f, y, true) + 20f
-            if (hook != null) {
-                for (line in wrap(hook.uppercase(), 46f, 900f)) {
-                    y = box(c, line, 46f, Color.argb(200, 0, 0, 0), 540f, y, true) + 8f
-                }
-            }
-        }
-        landscapeLayer(c, i, n, end1, end2)
-        return bmp
-    }
-
-    override fun onDestroy() {
-        transformer?.cancel()
-        handler.removeCallbacks(poll)
-        super.onDestroy()
+        val busy = Engine.kind != Engine.Kind.IDLE
+        val p = Engine.progress
+        statusTv.text = if (!busy && Session.uri == null && !Engine.isError && Engine.captions == null)
+            "Выбери видео, чтобы начать" else Engine.status
+        statusTv.setTextColor(if (Engine.isError) ui.bad else ui.ink)
+        statusTv.typeface = if (Engine.isError) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        meter.value = if (busy) p else p.coerceAtLeast(0)
+        pctTv.text = if (busy && p >= 0) "$p%" else ""
+        startBtn.enable(!busy)
+        stopBtn.enable(busy)
+        pickBtn.enable(!busy)
+        aiBtn.enable(!busy)
+        val r = if (busy) null else resumable()
+        resumeBtn.visibility = if (r != null) View.VISIBLE else View.GONE
+        if (r != null) resumeBtn.text = "Продолжить с части ${r + 1}"
+        val cap = Engine.captions
+        resultHead.visibility = if (cap != null) View.VISIBLE else View.GONE
+        resultCard.visibility = if (cap != null) View.VISIBLE else View.GONE
+        if (cap != null && resultTv.text.toString() != cap) resultTv.text = cap
+        if (busy) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 }
